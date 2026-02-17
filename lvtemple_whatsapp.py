@@ -154,7 +154,7 @@ def format_events_message(events):
     end_date = start_date + timedelta(days=6)
 
     # Example: "Next 7 days Feb 18 2026 to Feb 24 2026."
-    header = f"Next 7 days {start_date.strftime('%b %d %Y')} to {end_date.strftime('%b %d %Y')}."
+    header = ""
     parts = [header]
 
     # Sort by date (list view is already chronological, but keep deterministic)
@@ -169,7 +169,7 @@ def format_events_message(events):
         title = ev.get("title", "")
 
         # Build one item sentence (avoid special chars, avoid newlines)
-        parts.append(f"{d} {t} {title}.")
+        parts.append(f"{t} {title}.")
 
     msg = " ".join(parts)
     msg = sanitize_for_whatsapp_param(msg)
