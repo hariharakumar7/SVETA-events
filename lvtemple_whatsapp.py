@@ -12,35 +12,36 @@ from zoneinfo import ZoneInfo
 # CONFIG
 # =======================
 
-# Timezone
 TZ = ZoneInfo("America/Los_Angeles")
 
-# LV Temple list view (this is the logic you said works)
+# LV Temple list view (your working scraping approach)
 LIST_URL = "https://www.lvtemple.org/events/list/"
 
-# WhatsApp Cloud API config (your setup)
+# WhatsApp Cloud API config
 GRAPH_VERSION = "v24.0"
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "934053346465745")
 
-# Your approved template details (from your earlier template list)
+# WhatsApp template info (your approved template)
 TEMPLATE_NAME = "events_list"
-LANG_CODE = "en"          # IMPORTANT: events_list is approved as "en" (not en_US)
+LANG_CODE = "en"          # IMPORTANT: events_list is approved in 'en'
 PARAM_NAME = "events"     # NAMED parameter
-
-# Hardcode recipients here (digits only is fine)
-RECIPIENTS = [
-    "14259791931",
-    # "1XXXXXXXXXX",
-]
 
 # Throttle between sends
 DELAY_BETWEEN_SENDS_SEC = 0.25
 
-# WhatsApp template param rules:
-# - no newline/tab characters
-# - no more than 4 consecutive spaces (we collapse whitespace)
-# Also: you asked for no special characters
+# WhatsApp template param rules + your preference
 MAX_PARAM_LEN = 900
+
+# Airtable config (from GitHub Secrets)
+# You said you'll create another secret for baseId:
+# Name it exactly AIRTABLE_BASE_ID
+AIRTABLE_TOKEN = os.environ["AIRTABLE_TOKEN"]
+AIRTABLE_BASE_ID = os.environ["AIRTABLE_BASE_ID"]
+AIRTABLE_TABLE_NAME = os.environ.get("AIRTABLE_TABLE_NAME", "Recipients")
+
+# Column names in Airtable (match these in your table)
+AIRTABLE_PHONE_FIELD = os.environ.get("AIRTABLE_PHONE_FIELD", "phone")
+AIRTABLE_ACTIVE_FIELD = os.environ.get("AIRTABLE_ACTIVE_FIELD", "active")
 
 # =======================
 # LOGGING
@@ -57,7 +58,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =======================
-# TEXT SANITIZATION (no special chars, WhatsApp-safe)
+# TEXT SANITIZATION
 # =======================
 _ALLOWED_PUNCT = set(" .,:;-/()")
 
@@ -94,11 +95,69 @@ def sanitize_for_whatsapp_param(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+def normalize_phone(phone: str) -> str | None:
+    """
+    Normalize phone number to digits-only string.
+    Accepts inputs like '+1 425-979-1931' and returns '14259791931'.
+    """
+    if not phone:
+        return None
+    digits = re.sub(r"\D", "", str(phone))
+    return digits if digits else None
+
+# =======================
+# AIRTABLE INTEGRATION
+# =======================
+def fetch_recipients_from_airtable() -> list[str]:
+    """
+    Fetch recipients from Airtable where active = TRUE().
+    Requires columns:
+      - phone (text)
+      - active (checkbox)
+    """
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
+    headers = {"Authorization": f"Bearer {AIRTABLE_TOKEN}"}
+
+    # Airtable formula: checkbox true
+    params = {
+        "filterByFormula": f"{{{AIRTABLE_ACTIVE_FIELD}}}=TRUE()",
+        "pageSize": 100,
+    }
+
+    recipients: list[str] = []
+    seen = set()
+
+    logger.info("Fetching recipients from Airtable...")
+    while True:
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+
+        # Helpful error detail if token/base/table is wrong
+        if r.status_code >= 300:
+            raise RuntimeError(f"Airtable fetch failed ({r.status_code}): {r.text[:300]}")
+
+        data = r.json()
+        records = data.get("records", []) or []
+
+        for rec in records:
+            fields = rec.get("fields", {}) or {}
+            phone_raw = fields.get(AIRTABLE_PHONE_FIELD)
+            phone = normalize_phone(phone_raw)
+            if phone and phone not in seen:
+                recipients.append(phone)
+                seen.add(phone)
+
+        offset = data.get("offset")
+        if not offset:
+            break
+        params["offset"] = offset
+
+    logger.info(f"Fetched {len(recipients)} active recipients from Airtable")
+    return recipients
+
 # =======================
 # SCRAPE EVENTS (your working logic)
 # =======================
 def get_7_day_events():
-    # Window: tomorrow through next 6 days (7-day window)
     start_date = datetime.now(TZ).date() + timedelta(days=1)
     end_date = start_date + timedelta(days=6)
 
@@ -107,7 +166,7 @@ def get_7_day_events():
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
     }
 
-    logger.info(f"Fetching events from {start_date.isoformat()} to {end_date.isoformat()} (7 days)")
+    logger.info(f"Fetching events from {start_date} to {end_date}...")
     response = requests.get(LIST_URL, params=params, headers=headers, timeout=30)
     response.raise_for_status()
 
@@ -125,14 +184,12 @@ def get_7_day_events():
         if not raw_date_str:
             continue
 
-        # datetime attribute can be 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'
         event_date = datetime.fromisoformat(raw_date_str.split()[0]).date()
 
         if start_date <= event_date <= end_date:
             title_el = article.find("a", class_="tribe-events-calendar-list__event-title-link")
             title = title_el.get_text(strip=True) if title_el else "Unknown Event"
 
-            # human-friendly text inside <time> (keep it as shown on site)
             display_time = " ".join(time_el.get_text(" ", strip=True).split())
 
             final_events.append({
@@ -147,29 +204,22 @@ def get_7_day_events():
     return final_events
 
 # =======================
-# FORMAT MESSAGE (single-line, no special chars)
+# FORMAT MESSAGE
 # =======================
 def format_events_message(events):
     start_date = datetime.now(TZ).date() + timedelta(days=1)
     end_date = start_date + timedelta(days=6)
 
-    # Example: "Next 7 days Feb 18 2026 to Feb 24 2026."
-    header = ""
+    header = f"Next 7 days {start_date.strftime('%b %d %Y')} to {end_date.strftime('%b %d %Y')}."
     parts = [header]
 
-    # Sort by date (list view is already chronological, but keep deterministic)
     events_sorted = sorted(events, key=lambda e: (e["date"], e.get("display_time") or ""))
 
     for ev in events_sorted:
-        # Include date explicitly for each item
         d = ev["date"].strftime("%b %d")
-        # display_time may already include date text; but your output shows it usually includes time.
-        # We'll keep it but sanitize.
         t = ev.get("display_time", "")
         title = ev.get("title", "")
-
-        # Build one item sentence (avoid special chars, avoid newlines)
-        parts.append(f"{t} {title}.")
+        parts.append(f"{d} {t} {title}.")
 
     msg = " ".join(parts)
     msg = sanitize_for_whatsapp_param(msg)
@@ -201,7 +251,7 @@ def send_whatsapp_template(token: str, to_number: str, events_text: str) -> dict
                         {
                             "type": "text",
                             "text": events_text,
-                            "parameter_name": PARAM_NAME,  # NAMED param (required)
+                            "parameter_name": PARAM_NAME,
                         }
                     ],
                 }
@@ -221,33 +271,37 @@ def send_whatsapp_template(token: str, to_number: str, events_text: str) -> dict
 def main():
     logger.info("Script started")
 
-    # Read token from env (GitHub Actions secret -> env)
-    token = os.environ["WHATSAPP_TOKEN"]
+    whatsapp_token = os.environ["WHATSAPP_TOKEN"]
 
-    # 1) Scrape events
+    # 1) Fetch recipients from Airtable
+    recipients = fetch_recipients_from_airtable()
+    if not recipients:
+        logger.info("No active recipients found in Airtable. Nothing to send.")
+        return
+
+    # 2) Scrape events for next 7 days
     events = get_7_day_events()
-
-    # 2) If no events, do not send any messages
     if not events:
         logger.info("No events found for the next 7 days. Not sending any WhatsApp messages.")
         return
 
-    # 3) Format message (WhatsApp-safe + no special chars)
+    # 3) Format message
     events_text = format_events_message(events)
     logger.info(f"Final WhatsApp param length={len(events_text)}")
     logger.info(f"Final WhatsApp param text: {events_text}")
 
     # 4) Send to all recipients
     sent, failed = 0, 0
-    for n in RECIPIENTS:
+    for n in recipients:
         try:
-            res = send_whatsapp_template(token, n, events_text)
+            res = send_whatsapp_template(whatsapp_token, n, events_text)
             msg_id = (res.get("messages") or [{}])[0].get("id")
             logger.info(f"Sent to {n} message_id={msg_id}")
             sent += 1
         except Exception as e:
             logger.error(f"Failed to send to {n}: {e}")
             failed += 1
+
         time.sleep(DELAY_BETWEEN_SENDS_SEC)
 
     logger.info(f"Done. Sent={sent} Failed={failed}")
