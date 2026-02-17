@@ -210,7 +210,7 @@ def format_events_message(events):
     start_date = datetime.now(TZ).date() + timedelta(days=1)
     end_date = start_date + timedelta(days=6)
 
-    header = f"Next 7 days {start_date.strftime('%b %d %Y')} to {end_date.strftime('%b %d %Y')}."
+    header = ""
     parts = [header]
 
     events_sorted = sorted(events, key=lambda e: (e["date"], e.get("display_time") or ""))
@@ -219,7 +219,7 @@ def format_events_message(events):
         d = ev["date"].strftime("%b %d")
         t = ev.get("display_time", "")
         title = ev.get("title", "")
-        parts.append(f"{d} {t} {title}.")
+        parts.append(f"{t} {title}.")
 
     msg = " ".join(parts)
     msg = sanitize_for_whatsapp_param(msg)
