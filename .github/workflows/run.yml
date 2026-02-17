@@ -26,3 +26,9 @@ jobs:
           WHATSAPP_TOKEN: ${{ secrets.WHATSAPP_TOKEN }}
           PHONE_NUMBER_ID: ${{ secrets.PHONE_NUMBER_ID }}
         run: python lvtemple_whatsapp.py
+        
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: whatsapp-logs
+          path: logs/lvtemple.log
