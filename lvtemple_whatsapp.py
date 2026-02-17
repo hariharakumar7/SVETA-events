@@ -5,11 +5,45 @@ import time
 import logging
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # =======================
-# Logging setup
+# CONFIG
+# =======================
+
+# Timezone
+TZ = ZoneInfo("America/Los_Angeles")
+
+# LV Temple list view (this is the logic you said works)
+LIST_URL = "https://www.lvtemple.org/events/list/"
+
+# WhatsApp Cloud API config (your setup)
+GRAPH_VERSION = "v24.0"
+PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "934053346465745")
+
+# Your approved template details (from your earlier template list)
+TEMPLATE_NAME = "events_list"
+LANG_CODE = "en"          # IMPORTANT: events_list is approved as "en" (not en_US)
+PARAM_NAME = "events"     # NAMED parameter
+
+# Hardcode recipients here (digits only is fine)
+RECIPIENTS = [
+    "14259791931",
+    # "1XXXXXXXXXX",
+]
+
+# Throttle between sends
+DELAY_BETWEEN_SENDS_SEC = 0.25
+
+# WhatsApp template param rules:
+# - no newline/tab characters
+# - no more than 4 consecutive spaces (we collapse whitespace)
+# Also: you asked for no special characters
+MAX_PARAM_LEN = 900
+
+# =======================
+# LOGGING
 # =======================
 LOG_DIR = "logs"
 LOG_FILE = f"{LOG_DIR}/lvtemple.log"
@@ -23,207 +57,132 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =======================
-# Config
+# TEXT SANITIZATION (no special chars, WhatsApp-safe)
 # =======================
-TZ = ZoneInfo("America/Los_Angeles")
+_ALLOWED_PUNCT = set(" .,:;-/()")
 
-# Month view (The Events Calendar)
-CALENDAR_MONTH_URL = "https://www.lvtemple.org/calendar/?tribe-bar-date={date}&eventDisplay=month"
+def to_ascii_basic(s: str) -> str:
+    """
+    Keep only:
+      - letters, digits, whitespace
+      - basic punctuation: . , : ; - / ( )
+    Remove bullets/fancy dashes/emoji/non-ascii.
+    """
+    if not s:
+        return ""
+    s = s.replace("\u00a0", " ")
+    s = s.replace("–", "-").replace("—", "-").replace("•", " ")
+    s = s.encode("ascii", errors="ignore").decode("ascii")  # drop non-ascii
 
-# WhatsApp Cloud API
-GRAPH_VERSION = "v24.0"
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "934053346465745")
+    out = []
+    for ch in s:
+        if ch.isalnum() or ch.isspace() or ch in _ALLOWED_PUNCT:
+            out.append(ch)
+        else:
+            out.append(" ")
+    return "".join(out)
 
-# Your approved template:
-# name: events_list
-# language: en
-# parameter_format: NAMED
-TEMPLATE_NAME = "events_list"
-LANG_CODE = "en"
-PARAM_NAME = "events"
-
-# Hardcode recipients (digits only is fine)
-RECIPIENTS = [
-    "14259791931",
-    # "1XXXXXXXXXX",
-    # "1YYYYYYYYYY",
-]
-
-DELAY_BETWEEN_SENDS_SEC = 0.25
-
-# WhatsApp template param constraints:
-# - No \n / \t in param value
-# - Avoid long whitespace runs
-# Keep it conservative
-MAX_PARAM_LEN = 900
-
-# =======================
-# Regex patterns
-# =======================
-DAY_HEADER_RE = re.compile(
-    r"^\s*(\d+)\s+events?,?\s+(\d{1,2})\s*$",
-    re.IGNORECASE,
-)
-
-TIME_RE = re.compile(
-    r"\b\d{1,2}:\d{2}\s*(am|pm)\b(?:\s*[-–]\s*\d{1,2}:\d{2}\s*(am|pm)\b)?",
-    re.IGNORECASE,
-)
-
-MONTH_NAME_RE = re.compile(r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\b", re.IGNORECASE)
-
-MONTHS = {
-    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
-    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12
-}
-
-# =======================
-# Helpers
-# =======================
-def fetch_html(url: str) -> str:
-    logger.info(f"Fetching calendar page: {url}")
-    r = requests.get(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (LVTempleBot/1.0)"},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.text
-
-def sanitize_template_param(s: str) -> str:
-    # WhatsApp template param rule: no newlines/tabs, no >4 spaces
+def sanitize_for_whatsapp_param(s: str) -> str:
+    """
+    WhatsApp template param restrictions:
+      - No \n \t
+      - No long whitespace runs
+    Plus "no special chars" requirement.
+    """
+    s = to_ascii_basic(s)
     s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def detect_month_year_context(soup: BeautifulSoup, fallback: date) -> tuple[int, int]:
-    """
-    Try to infer the month/year currently being displayed in the month view.
-    If we can't, fallback to the passed-in date.
-    """
-    # Many month views include a title like "February 2026"
-    page_text = soup.get_text(" ", strip=True)
-    # Find month name near a year
-    # We keep this permissive; if it fails we fallback.
-    m_month = MONTH_NAME_RE.search(page_text)
-    m_year = re.search(r"\b(20\d{2})\b", page_text)
-    if m_month and m_year:
-        month = MONTHS[m_month.group(1).lower()]
-        year = int(m_year.group(1))
-        return year, month
-    return fallback.year, fallback.month
+# =======================
+# SCRAPE EVENTS (your working logic)
+# =======================
+def get_7_day_events():
+    # Window: tomorrow through next 6 days (7-day window)
+    start_date = datetime.now(TZ).date() + timedelta(days=1)
+    end_date = start_date + timedelta(days=6)
 
-def find_day_header_element(soup: BeautifulSoup, target_day: int):
-    """
-    Find the element whose text looks like:
-      '0 events  18'  or  '2 events,  1'
-    and where the day number matches target_day.
-    """
-    candidates = soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "div", "span", "p"])
-    for el in candidates:
-        txt = el.get_text(" ", strip=True)
-        m = DAY_HEADER_RE.match(txt)
-        if not m:
+    params = {"tribe-bar-date": start_date.isoformat()}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+    }
+
+    logger.info(f"Fetching events from {start_date.isoformat()} to {end_date.isoformat()} (7 days)")
+    response = requests.get(LIST_URL, params=params, headers=headers, timeout=30)
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    articles = soup.find_all("article", class_="tribe-events-calendar-list__event")
+
+    final_events = []
+
+    for article in articles:
+        time_el = article.find("time", class_="tribe-events-calendar-list__event-datetime")
+        if not time_el:
             continue
-        day_num = int(m.group(2))
-        if day_num == target_day:
-            return el
-    return None
 
-def extract_events_under_day_header(day_header_el) -> list[dict]:
-    """
-    Starting from the day header element, walk forward until the next day header.
-    Collect event links and their nearby times.
-    """
-    events = []
-    seen = set()
+        raw_date_str = time_el.get("datetime")
+        if not raw_date_str:
+            continue
 
-    for el in day_header_el.next_elements:
-        if hasattr(el, "get_text"):
-            txt = el.get_text(" ", strip=True)
-            if DAY_HEADER_RE.match(txt):
-                break
+        # datetime attribute can be 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'
+        event_date = datetime.fromisoformat(raw_date_str.split()[0]).date()
 
-        if getattr(el, "name", None) == "a" and el.has_attr("href"):
-            title = el.get_text(" ", strip=True)
-            href = el["href"]
-            if not title:
-                continue
-            if "/event" not in href and "/events" not in href:
-                continue
+        if start_date <= event_date <= end_date:
+            title_el = article.find("a", class_="tribe-events-calendar-list__event-title-link")
+            title = title_el.get_text(strip=True) if title_el else "Unknown Event"
 
-            key = (title, href)
-            if key in seen:
-                continue
-            seen.add(key)
+            # human-friendly text inside <time> (keep it as shown on site)
+            display_time = " ".join(time_el.get_text(" ", strip=True).split())
 
-            container = el.find_parent(["article", "div", "li", "td", "section"]) or el.parent
-            block_text = container.get_text(" ", strip=True) if container else ""
-            m = TIME_RE.search(block_text)
-            time_text = m.group(0) if m else None
+            final_events.append({
+                "date": event_date,
+                "display_time": display_time,
+                "title": title
+            })
+        elif event_date > end_date:
+            break
 
-            events.append({"title": title, "time": time_text})
+    logger.info(f"Extracted {len(final_events)} events in the 7-day window")
+    return final_events
 
-    return events
+# =======================
+# FORMAT MESSAGE (single-line, no special chars)
+# =======================
+def format_events_message(events):
+    start_date = datetime.now(TZ).date() + timedelta(days=1)
+    end_date = start_date + timedelta(days=6)
 
-def get_events_for_date(target: date) -> list[dict]:
-    """
-    Fetch month view for target date and extract events ONLY for that day.
-    Returns list of {"date": date, "time": str|None, "title": str}
-    """
-    url = CALENDAR_MONTH_URL.format(date=target.isoformat())
-    html = fetch_html(url)
-    soup = BeautifulSoup(html, "html.parser")
-
-    day_header = find_day_header_element(soup, target.day)
-    if not day_header:
-        logger.info(f"Could not locate day header for {target.isoformat()} (day={target.day}).")
-        return []
-
-    header_txt = day_header.get_text(" ", strip=True)
-    m = DAY_HEADER_RE.match(header_txt)
-    count = int(m.group(1)) if m else None
-    logger.info(f"{target.isoformat()} header: '{header_txt}'")
-
-    if count == 0:
-        return []
-
-    day_events = extract_events_under_day_header(day_header)
-    out = []
-    for e in day_events:
-        out.append({"date": target, "time": e.get("time"), "title": e.get("title")})
-    return out
-
-def format_events_7d_one_line(start: date, events: list[dict], max_len: int = MAX_PARAM_LEN) -> str:
-    """
-    One-line string safe for WhatsApp template params.
-    Includes date per event. Example:
-
-    Next 7 days (Feb 18–Feb 24): Feb 18 7:00 pm — Aarti • Feb 19 10:00 am — Puja • ...
-    """
-    end = start + timedelta(days=6)
-    header = f"Next 7 days ({start.strftime('%b %d')}–{end.strftime('%b %d')}):"
+    # Example: "Next 7 days Feb 18 2026 to Feb 24 2026."
+    header = f"Next 7 days {start_date.strftime('%b %d %Y')} to {end_date.strftime('%b %d %Y')}."
     parts = [header]
 
-    # Sort events by date then time text
-    def sort_key(e):
-        # time_text sorting is best-effort; keep None last
-        t = e.get("time") or "zzzz"
-        return (e["date"], t.lower())
+    # Sort by date (list view is already chronological, but keep deterministic)
+    events_sorted = sorted(events, key=lambda e: (e["date"], e.get("display_time") or ""))
 
-    for e in sorted(events, key=sort_key):
-        d = e["date"].strftime("%b %d")
-        t = e.get("time") or "Time TBD"
-        title = (e.get("title") or "").strip()
-        parts.append(f"{d} {t} — {title}")
+    for ev in events_sorted:
+        # Include date explicitly for each item
+        d = ev["date"].strftime("%b %d")
+        # display_time may already include date text; but your output shows it usually includes time.
+        # We'll keep it but sanitize.
+        t = ev.get("display_time", "")
+        title = ev.get("title", "")
 
-    out = " • ".join(parts)
-    out = sanitize_template_param(out)
+        # Build one item sentence (avoid special chars, avoid newlines)
+        parts.append(f"{d} {t} {title}.")
 
-    if len(out) > max_len:
-        out = out[: max_len - 10].rstrip(" •|-") + " • (more)"
-    return out
+    msg = " ".join(parts)
+    msg = sanitize_for_whatsapp_param(msg)
 
+    if len(msg) > MAX_PARAM_LEN:
+        msg = msg[: MAX_PARAM_LEN - 6].rstrip(" .,:;-/()") + " more."
+        msg = sanitize_for_whatsapp_param(msg)
+
+    return msg
+
+# =======================
+# WHATSAPP SEND
+# =======================
 def send_whatsapp_template(token: str, to_number: str, events_text: str) -> dict:
     url = f"https://graph.facebook.com/{GRAPH_VERSION}/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -242,7 +201,7 @@ def send_whatsapp_template(token: str, to_number: str, events_text: str) -> dict
                         {
                             "type": "text",
                             "text": events_text,
-                            "parameter_name": PARAM_NAME,  # NAMED param
+                            "parameter_name": PARAM_NAME,  # NAMED param (required)
                         }
                     ],
                 }
@@ -257,45 +216,41 @@ def send_whatsapp_template(token: str, to_number: str, events_text: str) -> dict
     return data
 
 # =======================
-# Main
+# MAIN
 # =======================
 def main():
     logger.info("Script started")
+
+    # Read token from env (GitHub Actions secret -> env)
     token = os.environ["WHATSAPP_TOKEN"]
 
-    start_date = datetime.now(TZ).date() + timedelta(days=1)  # tomorrow
-    dates = [start_date + timedelta(days=i) for i in range(7)]
+    # 1) Scrape events
+    events = get_7_day_events()
 
-    all_events: list[dict] = []
-    for d in dates:
-        try:
-            day_events = get_events_for_date(d)
-            logger.info(f"Extracted {len(day_events)} events for {d.isoformat()}")
-            all_events.extend(day_events)
-        except Exception as e:
-            logger.error(f"Error extracting events for {d.isoformat()}: {e}")
-
-    if not all_events:
-        logger.info(f"No events found for the next 7 days starting {start_date.isoformat()}. Not sending any messages.")
+    # 2) If no events, do not send any messages
+    if not events:
+        logger.info("No events found for the next 7 days. Not sending any WhatsApp messages.")
         return
 
-    events_text = format_events_7d_one_line(start_date, all_events)
-    logger.info(f"WhatsApp param text: {events_text}")
+    # 3) Format message (WhatsApp-safe + no special chars)
+    events_text = format_events_message(events)
+    logger.info(f"Final WhatsApp param length={len(events_text)}")
+    logger.info(f"Final WhatsApp param text: {events_text}")
 
+    # 4) Send to all recipients
     sent, failed = 0, 0
     for n in RECIPIENTS:
         try:
             res = send_whatsapp_template(token, n, events_text)
-            msg_id = res.get("messages", [{}])[0].get("id")
-            logger.info(f"✅ Sent to {n}: {msg_id}")
+            msg_id = (res.get("messages") or [{}])[0].get("id")
+            logger.info(f"Sent to {n} message_id={msg_id}")
             sent += 1
         except Exception as e:
-            logger.error(f"❌ Failed to send to {n}: {e}")
+            logger.error(f"Failed to send to {n}: {e}")
             failed += 1
-
         time.sleep(DELAY_BETWEEN_SENDS_SEC)
 
-    logger.info(f"Done. Sent={sent}, Failed={failed}")
+    logger.info(f"Done. Sent={sent} Failed={failed}")
 
 if __name__ == "__main__":
     main()
