@@ -2,7 +2,7 @@ name: Run LV Temple WhatsApp Bot
 
 on:
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '13 3 * * *'
   workflow_dispatch:
 
 jobs:
